@@ -295,7 +295,7 @@ tradition. Errors will exit with C<255>, which corresponds to a C<die>
 in Perl.
 
 When applicable, any other HTTP response from the replayd server (e.g.,
-L<api.StormReplay.com>, will result in a non-0 exit code. Any API responses
+L<StormReplay.com>, will result in a non-0 exit code. Any API responses
 that indicate an error will also display the error message via C<STDERR>.
 
 
