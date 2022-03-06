@@ -1,0 +1,397 @@
+#!/usr/bin/env perl
+package local::bin::stormcli;
+
+use strict;
+use warnings;
+use Util::H2O::More qw/h2o opt2h2o o2h/;
+use HTTP::Tiny qw//;
+use Getopt::Long qw//;
+use Config::Tiny qw//;
+use Digest::SHA qw/sha256_hex/;
+use MIME::Base64 qw/encode_base64/;
+use Time::HiRes qw//;
+use JSON::PP qw/decode_json encode_json/;
+
+# poor man's easy debugger via Data::Dumper
+sub DD($$) {
+    require Data::Dumper;
+    print Data::Dumper::Dumper( $_[0] );
+    if ( $_[1] ) {
+        print qq{enter to continue\n};
+        my $staph = <STDIN>;
+    }
+    return $_[0];
+}
+
+use constant {
+    EXIT_SUCCESS   => 0,
+    EXIT_ERROR     => 255,
+    DEFAULT_CONFIG => sprintf( qq{%s/asgs-global.conf}, ( getpwuid($<) )[7] ),    # $HOME/asgs-global.conf
+    BASEURL        => q{https://stormreplay.com/api},
+};
+
+my $config = h2o -recurse, { %{ Config::Tiny->read(DEFAULT_CONFIG) } }, qw/apikey apisecret loop notify email/;
+
+my $subcommand = shift @ARGV;
+
+my $subcmds = h2o {
+    delete => sub { delete_storm(@_) },                                           # delete a running storm by name
+    start  => sub { start_storm(@_) },                                            # start a storm replay
+    status => sub { status_running(@_) },                                         # get status of all user's running storms
+    storms => sub { get_storms(@_) },                                             # look at list of supported storms and details (startadv, endadv, etc)
+    uuid   => sub { get_uuid(@_) },                                               # get user information
+  },
+  ($subcommand);
+
+if ( not $subcmds->$subcommand or ref $subcmds->$subcommand ne q{CODE} ) {
+    die qq{$subcommand is not a valid subcommand!\n};
+}
+
+if ( not caller ) {
+    exit $subcmds->$subcommand->( \@ARGV );
+}
+
+sub _storm_lookup {
+    my $gURL      = sprintf( qq{%s/%s}, BASEURL, q{storms} );
+    my $signed_ua = _get_signed_user_agent();
+    my $response  = h2o -recurse, $signed_ua->get($gURL);
+
+    # die if error because we're 1 call level deeper than a subcommand handler,
+    # so this makes it easier to print the error
+    if ( not $response->success ) {
+        die qq{(error!) HTTP Status %d - %s\n}, $response->status, $response->content->msg;
+    }
+
+    my $content = h2o decode_json $response->content;
+    return $content->storms;
+}
+
+sub start_storm {
+    my @_ARGV = @_;
+
+    my @getopts = qw/name=s frequency=s startadv=i endadv=i loop notify email=s/;
+    my $o       = h2o {
+        name      => q{},
+        frequency => $config->replayd->frequency || 21_600,
+        loop      => $config->replayd->loop      || 0,
+        notify    => $config->replayd->notify    || 0,
+        email     => $config->replayd->email     || q{},
+      },
+      opt2h2o @getopts;
+
+    Getopt::Long::GetOptionsFromArray( @_ARGV, $o, @getopts );
+
+    my $signed_ua = _get_signed_user_agent();
+    my $gURL      = sprintf( qq{%s/%s}, BASEURL, q{configure} );
+
+    my $storms = h2o -recurse, _storm_lookup;
+
+    my $name = $o->name;
+    if ( not $name or not $storms->$name ) {
+        die sprintf qq{"%s" is not a supported storm!\n}, $o->name;
+    }
+
+    # set defaults, set based on min/max
+    $o->startadv( $storms->$name->minstartadv ) if ( !$o->startadv or $o->startadv < $storms->$name->minstartadv );
+    $o->endadv( $storms->$name->maxendadv )     if ( !$o->endadv   or $o->endadv > $storms->$name->maxstartadv );
+
+    # precheck
+    die qq{(fatal!) --startadv can't be after --endadv!\n} if $o->startadv > $o->endadv;
+
+    my $data = encode_json( o2h $o );
+
+    my $response = h2o -recurse, $signed_ua->post( $gURL, { content => $data } );
+    my $content  = h2o decode_json $response->content;
+
+    if ( not $response->success ) {
+        printf STDOUT qq{(error!) HTTP Status %d - %s\n}, $response->status, $content->msg;
+        return EXIT_ERROR;
+    }
+
+    # exit code is affected by the success of the call to start a storm
+    return EXIT_SUCCESS;
+}
+
+sub status_running {
+    my @_ARGV = @_;
+
+    my @getopts = (qw/as=s/);
+    my $o       = h2o {}, opt2h2o @getopts;
+    Getopt::Long::GetOptionsFromArray( @_ARGV, $o, @getopts );
+
+    my $signed_ua = _get_signed_user_agent();
+    my $gURL      = sprintf( qq{%s/%s}, BASEURL, q{status} );
+    my $response  = h2o $signed_ua->get($gURL);
+    my $content   = h2o decode_json $response->content;
+
+    if ( not $response->success ) {
+        printf STDOUT qq{(error!) HTTP Status %d - %s\n}, $response->status, $content->msg;
+        return EXIT_ERROR;
+    }
+
+    # dump pure json
+    if ( $o->as and $o->as eq q{json} ) {
+        printf qq{%s\n}, $response->content;
+    }
+
+    # human readable listing, default
+    else {
+        my $storms = h2o -recurse, decode_json $response->content;
+        my @storms = keys %$storms;
+        if ( my $count = @storms ) {
+            printf qq{%02d storm%s found! \n}, $count, ( $count != 1 ) ? q{s} : q {};
+        }
+        else {
+            print qq{No storms found! \n};
+        }
+        foreach my $storm (@storms) {
+            my $s = $storms->$storm;
+            printf qq{- %s (%s, adv %02d \@ %05d sec, loop: % 3s, notify: % 3s)\n}, $storm, $s->status->status->STATE, $s->status->status->CURRENTADV, $s->config->replayd->FREQUENCY, ( $s->config->replayd->LOOP ) ? q{yes} : q{no}, ( $s->config->replayd->NOTIFY ) ? q{yes, to '} . $s->config->replayd->EMAIL . q{'} : q{no};
+        }
+    }
+
+    # check status, report contents
+    return EXIT_SUCCESS;
+}
+
+sub get_storms {
+    my @_ARGV = @_;
+
+    my @getopts = (qw/as=s/);
+    my $o       = h2o {}, opt2h2o @getopts;
+    Getopt::Long::GetOptionsFromArray( @_ARGV, $o, @getopts );
+
+    my $storms = h2o -recurse, _storm_lookup;
+
+    # dump pure json
+    if ($o->as and $o->as eq q{json} ) {
+        my $json = encode_json o2h -recurse, $storms;
+        printf qq{%s\n}, $json;
+    }
+
+    # human readable listing, default
+    else {
+        my @storms = keys %{$storms};
+        if ( my $count = @storms ) {
+            printf qq{%02d supported storm%s found! \n}, $count, ( $count != 1 ) ? q{s} : q {};
+        }
+        else {
+            print qq{No supported storms found! \n};
+        }
+
+        foreach my $storm (@storms) {
+            printf qq{ - %-7s (%d); (adv: %d-%d)\n}, $storm, $storms->$storm->year, $storms->$storm->minstartadv, $storms->$storm->maxendadv;
+        }
+    }
+
+    return EXIT_SUCCESS;
+}
+
+sub delete_storm {
+    my @_ARGV = @_;
+
+    my @getopts = (qw/name=s/);
+    my $o       = h2o {}, opt2h2o @getopts;
+    Getopt::Long::GetOptionsFromArray( @_ARGV, $o, @getopts );
+
+    # assert --name is provided
+    die qq{--name <storm-name>, is required for the "delete" subcommand!\n} if not $o->name;
+
+    my $signed_ua = _get_signed_user_agent();
+
+    my $gURL     = sprintf( qq{%s/%s/%s}, BASEURL, q{configure}, $o->name );
+    my $response = h2o -recurse, $signed_ua->delete($gURL);
+    my $content  = h2o decode_json $response->content;
+
+    if ( not $response->success ) {
+        printf STDOUT qq{(error!) HTTP Status %d - %s\n}, $response->status, $content->msg;
+        return EXIT_ERROR;
+    }
+
+    return EXIT_SUCCESS;
+}
+
+sub get_uuid {
+    my @_ARGV     = @_;
+    my $signed_ua = _get_signed_user_agent();
+    my $gURL      = sprintf( qq{%s/%s}, BASEURL, q{uuid} );
+    my $response  = h2o -recurse, $signed_ua->get($gURL);
+    my $content   = h2o decode_json $response->content;
+
+    if ( not $response->success ) {
+        printf STDOUT qq{(error!) HTTP Status %d - %s\n}, $response->status, $content->msg;
+        return EXIT_ERROR;
+    }
+
+    if ( $response->success ) {
+        my $hashref = h2o decode_json $response->content;
+        printf qq{uuid: %05d (md5: %s)\n}, $hashref->uuid, $hashref->md5;
+    }
+
+    return EXIT_SUCCESS;
+}
+
+sub _get_signed_user_agent {
+    my $key    = $config->replayd->apikey;
+    my $secret = $config->replayd->apisecret;
+
+    # add $secret to string, get SHA256 hash
+    my $nonce         = Time::HiRes::time * 100_000;
+    my $signature     = sha256_hex( $nonce . $secret );
+    my $authorization = encode_base64( sprintf( qq{%s:%s}, $key, $signature ), q{} );
+
+    my $default_headers = {
+        q{x-replayd-api-version} => q{1.0},
+        q{x-auth-nonce}          => $nonce,
+        q{Authorization}         => $authorization,
+        q{Content-Type}          => q{application/json},
+    };
+
+    return HTTP::Tiny->new( ( default_headers => $default_headers ) );
+}
+
+1;
+
+__END__
+
+=pod
+
+=head1 NAME
+
+replaycli - commandline client for StormReplay.com's service
+
+=head1 SYNOPSIS
+
+The utility currently supports 4 subcommands, e.g.:
+
+    # list storms available to replay; provides descriptive format or raw JSON
+    replaycli storms [--as json]
+
+    # start a storm
+    replaycli start --name dorian --startadv start_adv --endadv end_adv [--frequency num_second] [--loop] [--notify] [--email youremail@email.tdl]
+
+    # get status on all running storms for this user; provides descriptive format or raw JSON.
+    replycli status [--as json]
+
+    # delete storm specified via --name
+    replycli delete --name dorian 
+
+    # get information on current user
+    replycli uuid
+
+=head1 DESCRIPTION
+
+This utility is a commandline client written to interact with the API
+at L<StormReplay.com>.
+
+It works using a series of I<subcommands>. This is done so the actions
+being taking can more clearly line up the desired result and the API
+endpoint that will be used against it.
+
+=head2 Note on Exit Codes and Error Messages
+
+All successful subcommands will exit with a status of C<0>, per Unix
+tradition. Errors will exit with C<255>, which corresponds to a C<die>
+in Perl.
+
+When applicable, any other HTTP response from the replayd server (e.g.,
+L<api.StormReplay.com>, will result in a non-0 exit code. Any API responses
+that indicate an error will also display the error message via C<STDERR>.
+
+
+=head1 SUBCOMMANDS
+
+=head2 C<replycli start>
+
+Starts a storm, accepts the following options:
+
+=head3 Required
+
+=over 4
+
+=item C<--name SUPPORT_STORM_NAME>
+
+The name refers to one of the currently I<officially> supported storms.
+
+What storms are supported? Good question. :-)
+
+=item C<--startadv ADVNUM>
+
+Indicates the starting advisory to issue.
+
+=item C<--endadv ADVNUM>
+
+Indicates the ending advisory to issue.
+
+=back
+
+=head3 Optional
+
+=over 4
+
+=item C<--frequency SECONDS>
+
+Specifies how often a new advisory is issued. Default is 21600 seconds (6 hours).
+
+A custom default may be set in C<$HOME/asgs-global.conf>.
+
+=item C<--loop>
+
+When provided, the storm will restart automatically when the last advisory has been completed.
+
+Disabled by default. A custom default may be set in C<$HOME/asgs-global.conf>.
+
+=item C<--notify>
+
+Indicates that a notification email is sent when there is a new advisory issued. Requires that
+C<--email> is set.
+
+Disabled by default. A custom default may be set in C<$HOME/asgs-global.conf>.
+
+=item C<--email>
+
+Specifies the email address recipient for the emails sent indicating a new advisory has been
+issued. No other methods of notification are currently supported by the StormReplay API.
+
+Unset by default. A custom default may be set in C<$HOME/asgs-global.conf>.
+
+=back
+
+=head2 C<replycli storms [--as json]>
+
+Provides a listing of storms available to replay. Output defaults to a human readable
+listing; but can be provided as via, C<--as json>.
+
+=head2 C<replycli status [--as json]>
+
+Lists all currently C<running> storms. When C<--as json> is used, the raw JSON is output
+to C<STDIN>. Otherwise, a human readable summary of each storm is presented.
+
+=head2 C<replycli delete --name STORM_NAME>
+
+Deletes storm specificed with the C<--name> option.
+
+=head2 C<replycli uuid>
+
+Displays current user's information.
+
+=head1 ENVIRONMENT
+
+C<~/asgs-global.conf> is used as a configuration file, which is used in ASGS
+for email configurations. This client is meant to be run most commonly with
+an ASGS environment.
+
+    [replayd]
+    apikey=thisistheAPI key
+    apisecret=thisisasecret
+    ;; following can be set for use with
+    ;; the 'start' subcommand
+    frequency=21600
+    loop=0
+    notify=0
+    email=notificatin@email.tld
+
+The credentials are provided when one is given account access to the L<ReplayStorm.com>
+service.
+
+=cut
