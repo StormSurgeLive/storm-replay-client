@@ -115,7 +115,7 @@ sub start_storm {
 sub status_running {
     my @_ARGV = @_;
 
-    my @getopts = (qw/as=s/);
+    my @getopts = (qw/as=s name=s/);
     my $o       = h2o {}, opt2h2o @getopts;
     Getopt::Long::GetOptionsFromArray( @_ARGV, $o, @getopts );
 
@@ -132,6 +132,33 @@ sub status_running {
     # dump pure json
     if ( $o->as and $o->as eq q{json} ) {
         printf qq{%s\n}, $response->content;
+    }
+
+    # as shell variables suitable for ASGS configuration file
+    elsif ( $o->as and $o->as eq q{config} ) {
+        die qq{--name is required to get storm config!\n} if not $o->name;
+        my $storm  = $o->name;
+        my $storms = h2o -recurse, decode_json($response->content), ($storm);
+        die qq{Storm "$storm" doesn't exist in status results!\n} if not $storms->$storm;
+        my $s        = $storms->$storm;
+        my $number   = $s->config->replayd->NUMBER;
+        my $now_year = $s->config->replayd->NOWYEAR;
+        my $hostname = $s->config->replayd->HOSTNAME;
+        my $md5 = $s->config->replayd->MD5;
+        my $ftp_hdir = sprintf(qq{%s/%s}, $s->config->replayd->FTP_HDIR, $md5);
+        my $rss_site = sprintf(qq{%s:%d/rss/%s}, $hostname, $s->config->replayd->HTTPPORT, $md5);
+        print <<EOF;
+#-- $storm configurations --#
+BACKGROUNDMET=off
+TROPICALCYCLONE=on
+  STORM=$number
+  YEAR=$now_year
+TRIGGER=rssembedded # required mode
+  FTPSITE=$hostname
+  HDIR=$ftp_hdir
+  RSSSITE=$rss_site/rss/c74d97b01eae257e44aa9d5bade97baf
+#-- $storm configurations --#
+EOF
     }
 
     # human readable listing, default
@@ -362,10 +389,19 @@ Unset by default. A custom default may be set in C<$HOME/asgs-global.conf>.
 Provides a listing of storms available to replay. Output defaults to a human readable
 listing; but can be provided as via, C<--as json>.
 
-=head2 C<replycli status [--as json]>
+=head2 C<replycli status [--as json | --as config --name <STORMNAME>]>
 
-Lists all currently C<running> storms. When C<--as json> is used, the raw JSON is output
-to C<STDIN>. Otherwise, a human readable summary of each storm is presented.
+Lists all currently C<running> storms.
+
+When C<--as json> is used, the raw JSON is output to C<STDIN>.
+
+When C<--as config> is used, an additional parameter is required to
+specifiy the storm name, C<--name>. If the storm is currently running,
+a block of shell code will be printed that can be used inside of an
+ASGS configuration shell script to specify the information needed to
+track a storm that is being replayed.
+
+Otherwise, a human readable summary of each storm is presented.
 
 =head2 C<replycli delete --name STORM_NAME>
 
