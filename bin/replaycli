@@ -150,6 +150,7 @@ sub status_running {
         print <<EOF;
 #-- $storm configurations --#
 BACKGROUNDMET=off
+  HINDCASTLENGTH=30.0
 TROPICALCYCLONE=on
   STORM=$number
   YEAR=$now_year
