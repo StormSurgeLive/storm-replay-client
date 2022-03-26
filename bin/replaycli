@@ -350,6 +350,12 @@ The name refers to one of the currently I<officially> supported storms.
 
 What storms are supported? Good question. :-)
 
+=back
+
+=head3 Optional
+
+=over 4
+
 =item C<--startadv ADVNUM>
 
 Indicates the starting advisory to issue.
@@ -357,12 +363,6 @@ Indicates the starting advisory to issue.
 =item C<--endadv ADVNUM>
 
 Indicates the ending advisory to issue.
-
-=back
-
-=head3 Optional
-
-=over 4
 
 =item C<--frequency SECONDS>
 
