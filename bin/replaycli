@@ -146,7 +146,7 @@ sub status_running {
         my $storms = h2o -recurse, decode_json( $response->content ), ($storm);
         die qq{Storm "$storm" doesn't exist in status results!\n} if not $storms->$storm;
         my $s        = $storms->$storm;
-        my $number   = $s->config->replayd->NUMBER;
+        my $number   = sprintf(qq{%02d}, $s->config->replayd->NUMBER); # zero pad single digit for get_atcf.pl
         my $now_year = $s->config->replayd->NOWYEAR;
         my $hostname = $s->config->replayd->HOSTNAME;
         my $md5      = $s->config->replayd->MD5;
