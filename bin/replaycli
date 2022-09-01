@@ -152,6 +152,8 @@ sub status_running {
         my $hostname       = $s->config->replayd->HOSTNAME;
         my $md5            = $s->config->replayd->MD5;
         my $coldstartdate  = $s->config->replayd->COLDSTARTDATE;
+        my $start_adv       = $s->config->replayd->STARTADV;
+        my $end_adv         = $s->config->replayd->ENDADV;
         my $hindcastlength = sprintf qq{%.1f}, $s->config->replayd->HINDCASTLENGTH;
         my $ftp_hdir       = sprintf( qq{%s/%s}, $s->config->replayd->FTP_HDIR, $md5 );
         my $rss_site       = sprintf( qq{%s:%d/rss/%s}, $hostname, $s->config->replayd->HTTPPORT, $md5 );
@@ -165,6 +167,8 @@ BACKGROUNDMET=off              # NAM download/forcing
 TROPICALCYCLONE=on
   STORM=$number
   YEAR=$now_year
+  STARTADV=$start_adv
+  ENDADV=$end_adv
 TRIGGER=rssembedded          # required mode
   FTPSITE=$hostname
   HDIR=$ftp_hdir
